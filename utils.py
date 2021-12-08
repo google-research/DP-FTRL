@@ -47,9 +47,9 @@ def get_fn(general_params, privacy_params, paramss, find_next=False):
         fn += ['nonpriv']
     else:
         fn += ['_'.join(
-            [k + str(privacy_params[k]) for k in sorted(privacy_params) if k not in ['dpsgd', 'restart'] and privacy_params[k]])]
-    if 'restart' in privacy_params and privacy_params.restart:
-        fn += ['restart']
+            [k + str(privacy_params[k]) for k in sorted(privacy_params) if k not in ['dpsgd', 'completion'] and privacy_params[k]])]
+        if privacy_params.completion:
+            fn += ['completion']
 
     for params in paramss:
         s = []

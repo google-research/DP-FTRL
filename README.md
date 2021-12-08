@@ -17,10 +17,14 @@ This is not an officially supported Google product.
 ## Overview of the code
 
 The code is written in PyTorch. 
-*  `main.py` contains the training and evaluation steps for three datasets: `MNIST`, `CIFAR10`, and `EMNIST (byMerge)`.
-*  `optimizers.py` contains the DP-FTRL optimizer, and `ftrl_noise.py` contains the tree-aggregation protocol, which
+* `main.py` contains the training and evaluation steps for three datasets: `MNIST`, `CIFAR10`, and `EMNIST (byMerge)`.
+* `optimizers.py` contains the DP-FTRL optimizer, and `ftrl_noise.py` contains the tree-aggregation protocol, which
    is the core of the optimizer. 
-*  `privacy.py` contains the privacy accounting function for DP-FTRL.
+* `privacy.py` contains the privacy accounting function for DP-FTRL. This is
+   for the variant where the data order is given and we use the binary tree completion trick (Appendix D.2.1 and D.3 in the paper). For the other privacy computations, please refer to the [code](https://github.com/tensorflow/privacy/tree/master/tensorflow_privacy/privacy/analysis) in Tensorflow privacy
+   library.
+   (There were bugs in the previous version of the privacy accounting code.
+    Please refer to the errata in the paper for details.) 
 
 
 ## Example usage of the code
@@ -45,20 +49,26 @@ export ML_DATA="path to where you want the datasets saved"  # set a path to stor
 
 Now we can run the code to do DP-FTRL training. 
 For example, the following command trains a small CNN for `CIFAR-10` 
-with DP-FTRL noise `10.0`, batch size `500` for `100` epochs. 
+with DP-FTRL noise `46.3`, batch size `500` for `100` epochs (restarting every
+`20` epochs). 
 ```bash
 run=1
 CUDA_VISIBLE_DEVICES=0 PYTHONHASHSEED=$(($run - 1)) python main.py \
     --data=cifar10 --run=$run --dp_ftrl=true \
-    --epochs=100 --batch_size=500 --noise_multiplier=10 \
-    --learning_rate=20 --momentum=0.9
+    --epochs=100 --batch_size=500 --noise_multiplier=46.3 \
+    --restart=20 --effi_noise=True --tree_completion=True \
+    --learning_rate=50 --momentum=0.9
 ```
-The results, including accuracies and privacy guarantees, will be written as a
+The results will be written as a
 tensorboard file in the current folder (can be configured with flag `dir`).
 You can view it with tensorboard
 ```bash
 tensorboard --port 6006 --logdir .
 ```
+
+To get the privacy guarantee, please refer to the
+function `compute_epsilon_tree` in `privacy.py`. There is an
+example in the `main` of `privacy.py` for how to use it.
 
 
 ## Citing this work

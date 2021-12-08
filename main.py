@@ -25,15 +25,15 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 from tqdm import trange
 import numpy as np
 
+import tensorflow as tf
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from opacus import PrivacyEngine
 
+from optimizers import FTRLOptimizer
+from ftrl_noise import CummuNoiseTorch, CummuNoiseEffTorch
 from nn import get_nn
 from data import get_data
-from optimizers import FTRLOptimizer
-from privacy import compute_epsilon_tree
-from ftrl_noise import CummuNoise
 import utils
 from utils import EasyDict
 
@@ -46,7 +46,10 @@ flags.DEFINE_boolean('dp_ftrl', True, 'If True, train with DP-FTRL. If False, tr
 flags.DEFINE_float('noise_multiplier', 4.0, 'Ratio of the standard deviation to the clipping norm.')
 flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm.')
 
-flags.DEFINE_boolean('restart', False, 'If True, restart the tree after each epoch.')
+flags.DEFINE_integer('restart', 0, 'If > 0, restart the tree every this number of epoch(s).')
+flags.DEFINE_boolean('effi_noise', False, 'If True, use tree aggregation proposed in https://privacytools.seas.harvard.edu/files/privacytools/files/honaker.pdf.')
+flags.DEFINE_boolean('tree_completion', False, 'If true, generate until reaching a power of 2.')
+
 flags.DEFINE_float('momentum', 0, 'Momentum for DP-FTRL.')
 flags.DEFINE_float('learning_rate', 0.4, 'Learning rate.')
 flags.DEFINE_integer('batch_size', 250, 'Batch size.')
@@ -59,14 +62,16 @@ flags.DEFINE_string('dir', '.', 'Directory to write the results.')
 
 
 def main(argv):
+    tf.get_logger().setLevel('ERROR')
+    tf.config.experimental.set_visible_devices([], "GPU")
+
     # Setup random seed
     torch.backends.cudnn.deterministic = True
     torch.manual_seed(FLAGS.run - 1)
     np.random.seed(FLAGS.run - 1)
 
-    # Data and the privacy delta
+    # Data
     trainset, testset, ntrain, nclass = get_data(FLAGS.data)
-    delta = {'mnist': 1e-5, 'cifar10': 1e-5, 'emnist_merge': 1e-6}[FLAGS.data]
     print('Training set size', trainset.image.shape)
 
     # Hyperparameters for training.
@@ -76,6 +81,8 @@ def main(argv):
     noise_multiplier = FLAGS.noise_multiplier if FLAGS.dp_ftrl else -1
     clip = FLAGS.l2_norm_clip if FLAGS.dp_ftrl else -1
     lr = FLAGS.learning_rate
+    if not FLAGS.restart:
+        FLAGS.tree_completion = False
 
     report_nimg = ntrain if FLAGS.report_nimg == -1 else FLAGS.report_nimg
     assert report_nimg % batch == 0
@@ -83,21 +90,32 @@ def main(argv):
     # Get the name of the output directory.
     log_dir = os.path.join(FLAGS.dir, FLAGS.data,
                            utils.get_fn(EasyDict(batch=batch),
-                                        EasyDict(dpsgd=FLAGS.dp_ftrl, restart=FLAGS.restart, noise=noise_multiplier, clip=clip, mb=1),
+                                        EasyDict(dpsgd=FLAGS.dp_ftrl, restart=FLAGS.restart, completion=FLAGS.tree_completion, noise=noise_multiplier, clip=clip, mb=1),
                                         [EasyDict({'lr': lr}),
-                                         EasyDict(m=FLAGS.momentum if FLAGS.momentum > 0 else None),
+                                         EasyDict(m=FLAGS.momentum if FLAGS.momentum > 0 else None,
+                                                  effi=FLAGS.effi_noise),
                                          EasyDict(sd=FLAGS.run)]
                                         )
                            )
     print('Model dir', log_dir)
 
-    # Function to output batches of data
-    def data_stream():
-        while True:
-            perm = np.random.permutation(ntrain)
-            for i in range(num_batches):
-                batch_idx = perm[i * batch:(i + 1) * batch]
-                yield trainset.image[batch_idx], trainset.label[batch_idx]
+    # Class to output batches of data
+    class DataStream:
+        def __init__(self):
+            self.shuffle()
+
+        def shuffle(self):
+            self.perm = np.random.permutation(ntrain)
+            self.i = 0
+
+        def __call__(self):
+            if self.i == num_batches:
+                self.i = 0
+            batch_idx = self.perm[self.i * batch:(self.i + 1) * batch]
+            self.i += 1
+            return trainset.image[batch_idx], trainset.label[batch_idx]
+
+    data_stream = DataStream()
 
     # Function to conduct training for one epoch
     def train_loop(model, device, optimizer, cumm_noise, epoch, writer):
@@ -110,7 +128,7 @@ def main(argv):
         step = epoch * num_batches
         for it in loop:
             step += 1
-            data, target = next(data_stream())
+            data, target = data_stream()
             data = torch.Tensor(data).to(device)
             target = torch.LongTensor(target).to(device)
 
@@ -129,10 +147,8 @@ def main(argv):
                 model.train()
                 print('Step %04d Accuracy %.2f' % (step, 100 * acc_test))
 
-        eps = compute_epsilon_tree(FLAGS.restart, epoch + 1, num_batches, noise_multiplier, delta)
-        writer.add_scalar('privacy/eps', eps, epoch + 1)
         writer.add_scalar('eval/loss_train', np.mean(losses), epoch + 1)
-        print('Epoch %04d Loss %.2f Privacy %.4f' % (epoch + 1, np.mean(losses), eps))
+        print('Epoch %04d Loss %.2f' % (epoch + 1, np.mean(losses)))
 
     # Function for evaluating the model to get training and test accuracies
     def test(model, device, desc='Evaluating'):
@@ -163,23 +179,42 @@ def main(argv):
     # privacy analysis.
     # 2) use the CummuNoise module to generate the noise using the tree aggregation
     # protocol. The noise will be passed to the FTRL optimizer.
-    optimizer = FTRLOptimizer(model.parameters(), momentum=FLAGS.momentum)
+    optimizer = FTRLOptimizer(model.parameters(), momentum=FLAGS.momentum,
+                              record_last_noise=FLAGS.restart > 0 and FLAGS.tree_completion)
     if FLAGS.dp_ftrl:
         privacy_engine = PrivacyEngine(model, batch_size=batch, sample_size=ntrain, alphas=[], noise_multiplier=0, max_grad_norm=clip)
         privacy_engine.attach(optimizer)
     shapes = [p.shape for p in model.parameters()]
-    cumm_noise = CummuNoise(noise_multiplier * clip / batch, shapes, device)
+
+    def get_cumm_noise(effi_noise):
+        if FLAGS.dp_ftrl == False or noise_multiplier == 0:
+            return lambda: [torch.Tensor([0]).to(device)] * len(shapes)  # just return scalar 0
+        if not effi_noise:
+            cumm_noise = CummuNoiseTorch(noise_multiplier * clip / batch, shapes, device)
+        else:
+            cumm_noise = CummuNoiseEffTorch(noise_multiplier * clip / batch, shapes, device)
+        return cumm_noise
+
+    cumm_noise = get_cumm_noise(FLAGS.effi_noise)
 
     # The training loop.
     writer = SummaryWriter(os.path.join(log_dir, 'tb'))
     for epoch in range(epochs):
-        if FLAGS.restart:  # if restarting the tree aggregation, we'll setup a new optimizer and noise module
-            optimizer = FTRLOptimizer(model.parameters(), momentum=FLAGS.momentum)
-            if FLAGS.dp_ftrl:
-                privacy_engine.detach()
-                privacy_engine.attach(optimizer)
-            cumm_noise = CummuNoise(noise_multiplier * clip / batch, shapes, device)
         train_loop(model, device, optimizer, cumm_noise, epoch, writer)
+
+        if epoch + 1 == epochs:
+            break
+        restart_now = epoch < epochs - 1 and FLAGS.restart > 0 and (epoch + 1) % FLAGS.restart == 0
+        if restart_now:
+            last_noise = None
+            if FLAGS.tree_completion:
+                actual_steps = num_batches * FLAGS.restart
+                next_pow_2 = 2**(actual_steps - 1).bit_length()
+                if next_pow_2 > actual_steps:
+                    last_noise = cumm_noise.proceed_until(next_pow_2)
+            optimizer.restart(last_noise)
+            cumm_noise = get_cumm_noise(FLAGS.effi_noise)
+            data_stream.shuffle()  # shuffle the data only when restart
     writer.close()
 
 
